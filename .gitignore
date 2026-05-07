@@ -1,3 +1,16 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Bridge build artifacts
+whatsapp-bridge/whatsapp-bridge
+whatsapp-bridge/whatsapp-bridge.bak*
+whatsapp-bridge/whatsapp-bridge.new
+
+# Bridge runtime data (session keys, message DB, downloaded media)
+whatsapp-bridge/store/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

@@ -2,7 +2,9 @@
 
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
-With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
+With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages. **This fork additionally lets you create new WhatsApp groups and leave existing ones from the agent.**
+
+> **Fork notice.** This is a fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) with two extra MCP tools (`create_group`, `leave_group`) and an optional privacy allow-list for the bridge. See [Additions in this fork](#additions-in-this-fork).
 
 It connects to your **personal WhatsApp account** directly via the Whatsapp web multidevice API (using the [whatsmeow](https://github.com/tulir/whatsmeow) library). All your messages are stored locally in a SQLite database and only sent to an LLM (such as Claude) when the agent accesses them through tools (which you control).
 
@@ -29,7 +31,7 @@ Here's an example of what you can do when it's connected to Claude.
 1. **Clone this repository**
 
    ```bash
-   git clone https://github.com/lharries/whatsapp-mcp.git
+   git clone https://github.com/jayeshkaithwas/whatsapp-mcp.git
    cd whatsapp-mcp
    ```
 
@@ -140,6 +142,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **create_group**: Create a new WhatsApp group with the given name and participants (added in this fork)
+- **leave_group**: Leave a WhatsApp group by its JID (added in this fork)
 
 ### Media Handling Features
 
@@ -181,3 +185,51 @@ By default, just the metadata of the media is stored in the local database. The 
 - **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
+
+## Additions in this fork
+
+### `create_group`
+
+Create a new WhatsApp group:
+
+```python
+create_group(
+    name="Project X",                       # max 25 chars (WhatsApp limit)
+    participants=["919866457501", "..."],   # phone numbers (no '+') or @s.whatsapp.net JIDs
+    announce=False,                         # only admins can post
+    locked=False,                           # only admins can edit group info
+    ephemeral_seconds=0,                    # disappearing-messages timer (0 = off; common: 86400, 604800, 7776000)
+    is_community=False,                     # create as a community parent
+    community_parent_jid="",                # or attach as sub-group of an existing community
+    join_approval_required=False,           # new members need admin approval
+)
+```
+
+Your own number is added implicitly by WhatsApp — don't include it in `participants`. On success the tool returns the new group's JID.
+
+### `leave_group`
+
+WhatsApp's protocol has no "delete group". `leave_group(jid)` is the closest action: you exit, and the other members see "you left". Once the creator/admin leaves, the group is effectively dead.
+
+```python
+leave_group(jid="120363426272007458@g.us")
+```
+
+### Optional privacy allow-list
+
+The bridge can be told to only persist a subset of 1:1 chats — useful if you're running a shared/team WhatsApp account and want to keep personal chats out of the local SQLite. Set the env var before launching the bridge:
+
+```bash
+export WHATSAPP_ALLOWLIST_PATH=/path/to/allowlist.txt
+go run main.go     # or run the compiled binary
+```
+
+`allowlist.txt` is one bare JID per line; `#` starts a comment:
+
+```
+# Team contacts (1:1 chats with these numbers are stored)
+919866457501@s.whatsapp.net
+447911123456@s.whatsapp.net
+```
+
+Group chats (`@g.us`) are always stored when the allow-list is enabled. Broadcast lists are always dropped. **With `WHATSAPP_ALLOWLIST_PATH` unset, all chats are stored — same as upstream.**

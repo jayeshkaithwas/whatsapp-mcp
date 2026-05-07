@@ -41,6 +41,59 @@ type Message struct {
 	Filename  string
 }
 
+// Optional privacy filter. Set the WHATSAPP_ALLOWLIST_PATH env var to a file
+// containing one bare JID per line (e.g. "919866457501@s.whatsapp.net"); only
+// those 1:1 chats — plus all groups (@g.us) — will be persisted to the local
+// SQLite. Lines starting with # and inline `# comments` are ignored. With no
+// env var set, all chats are stored (upstream default).
+var (
+	allowListEnabled bool
+	allowedJIDs      = map[string]bool{}
+)
+
+func loadAllowList() {
+	allowedJIDs = map[string]bool{}
+	allowListEnabled = false
+	path := strings.TrimSpace(os.Getenv("WHATSAPP_ALLOWLIST_PATH"))
+	if path == "" {
+		fmt.Println("[allowlist] WHATSAPP_ALLOWLIST_PATH not set — storing all chats (upstream default)")
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Printf("[allowlist] Could not read %s: %v — falling back to storing all chats\n", path, err)
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = line[:idx]
+		}
+		jid := strings.TrimSpace(line)
+		if jid == "" {
+			continue
+		}
+		allowedJIDs[jid] = true
+	}
+	allowListEnabled = true
+	fmt.Printf("[allowlist] Loaded %d allowed JIDs from %s\n", len(allowedJIDs), path)
+}
+
+// isStorableJID returns true if data for this chat JID is allowed to be persisted
+// to the bridge SQLite. Broadcast lists are always dropped. When the allow-list
+// is enabled, only @g.us groups and explicitly-listed JIDs pass.
+func isStorableJID(jid string) bool {
+	if strings.Contains(jid, "@broadcast") {
+		return false
+	}
+	if !allowListEnabled {
+		return true
+	}
+	if strings.HasSuffix(jid, "@g.us") {
+		return true
+	}
+	return allowedJIDs[jid]
+}
+
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
@@ -100,6 +153,9 @@ func (store *MessageStore) Close() error {
 
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
+	if !isStorableJID(jid) {
+		return nil
+	}
 	_, err := store.db.Exec(
 		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
 		jid, name, lastMessageTime,
@@ -114,10 +170,13 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	if content == "" && mediaType == "" {
 		return nil
 	}
+	if !isStorableJID(chatJID) {
+		return nil
+	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
@@ -484,6 +543,159 @@ type DownloadMediaResponse struct {
 	Path     string `json:"path,omitempty"`
 }
 
+// CreateGroupRequest represents the request body for the create group API
+type CreateGroupRequest struct {
+	Name                 string   `json:"name"`
+	Participants         []string `json:"participants"`
+	Announce             bool     `json:"announce,omitempty"`
+	Locked               bool     `json:"locked,omitempty"`
+	EphemeralSeconds     uint32   `json:"ephemeral_seconds,omitempty"`
+	IsCommunity          bool     `json:"is_community,omitempty"`
+	CommunityParentJID   string   `json:"community_parent_jid,omitempty"`
+	JoinApprovalRequired bool     `json:"join_approval_required,omitempty"`
+}
+
+// CreateGroupResponse represents the response for the create group API
+type CreateGroupResponse struct {
+	Success          bool     `json:"success"`
+	Message          string   `json:"message"`
+	JID              string   `json:"jid,omitempty"`
+	Name             string   `json:"name,omitempty"`
+	ParticipantCount int      `json:"participant_count,omitempty"`
+	FailedAdds       []string `json:"failed_adds,omitempty"`
+}
+
+// LeaveGroupRequest represents the request body for the leave group API
+type LeaveGroupRequest struct {
+	JID string `json:"jid"`
+}
+
+// LeaveGroupResponse represents the response for the leave group API
+type LeaveGroupResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// leaveWhatsAppGroup leaves the specified group on WhatsApp.
+func leaveWhatsAppGroup(client *whatsmeow.Client, jidStr string) LeaveGroupResponse {
+	if !client.IsConnected() {
+		return LeaveGroupResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	jidStr = strings.TrimSpace(jidStr)
+	if jidStr == "" {
+		return LeaveGroupResponse{Success: false, Message: "Group JID is required"}
+	}
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return LeaveGroupResponse{Success: false, Message: fmt.Sprintf("Invalid JID: %v", err)}
+	}
+	if jid.Server != "g.us" {
+		return LeaveGroupResponse{Success: false, Message: "Only group JIDs (@g.us) can be left"}
+	}
+	if err := client.LeaveGroup(context.Background(), jid); err != nil {
+		return LeaveGroupResponse{Success: false, Message: fmt.Sprintf("Error leaving group: %v", err)}
+	}
+	return LeaveGroupResponse{Success: true, Message: fmt.Sprintf("Left group %s", jid.String())}
+}
+
+// createWhatsAppGroup creates a new group on WhatsApp.
+func createWhatsAppGroup(client *whatsmeow.Client, messageStore *MessageStore, req CreateGroupRequest) CreateGroupResponse {
+	if !client.IsConnected() {
+		return CreateGroupResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		return CreateGroupResponse{Success: false, Message: "Group name is required"}
+	}
+	// WhatsApp limits group subjects to 25 characters; whatsmeow returns 406 otherwise.
+	if len([]rune(req.Name)) > 25 {
+		return CreateGroupResponse{Success: false, Message: "Group name must be 25 characters or fewer"}
+	}
+	if len(req.Participants) == 0 {
+		return CreateGroupResponse{Success: false, Message: "At least one participant is required"}
+	}
+
+	participantJIDs := make([]types.JID, 0, len(req.Participants))
+	for _, p := range req.Participants {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		var jid types.JID
+		var err error
+		if strings.Contains(p, "@") {
+			jid, err = types.ParseJID(p)
+			if err != nil {
+				return CreateGroupResponse{Success: false, Message: fmt.Sprintf("Invalid participant JID %q: %v", p, err)}
+			}
+		} else {
+			jid = types.JID{User: strings.TrimPrefix(p, "+"), Server: "s.whatsapp.net"}
+		}
+		participantJIDs = append(participantJIDs, jid)
+	}
+	if len(participantJIDs) == 0 {
+		return CreateGroupResponse{Success: false, Message: "No valid participants after parsing"}
+	}
+
+	createReq := whatsmeow.ReqCreateGroup{
+		Name:         req.Name,
+		Participants: participantJIDs,
+	}
+	if req.Locked {
+		createReq.GroupLocked.IsLocked = true
+	}
+	if req.Announce {
+		createReq.GroupAnnounce.IsAnnounce = true
+	}
+	if req.EphemeralSeconds > 0 {
+		createReq.GroupEphemeral.IsEphemeral = true
+		createReq.GroupEphemeral.DisappearingTimer = req.EphemeralSeconds
+	}
+	if req.JoinApprovalRequired {
+		createReq.GroupMembershipApprovalMode.IsJoinApprovalRequired = true
+	}
+	if req.IsCommunity {
+		createReq.GroupParent.IsParent = true
+	}
+	if req.CommunityParentJID != "" {
+		parentJID, err := types.ParseJID(req.CommunityParentJID)
+		if err != nil {
+			return CreateGroupResponse{Success: false, Message: fmt.Sprintf("Invalid community_parent_jid: %v", err)}
+		}
+		createReq.GroupLinkedParent.LinkedParentJID = parentJID
+	}
+
+	groupInfo, err := client.CreateGroup(context.Background(), createReq)
+	if err != nil {
+		return CreateGroupResponse{Success: false, Message: fmt.Sprintf("Error creating group: %v", err)}
+	}
+
+	// Persist the new chat so it shows up in list_chats immediately.
+	createdAt := groupInfo.GroupCreated
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	if err := messageStore.StoreChat(groupInfo.JID.String(), groupInfo.Name, createdAt); err != nil {
+		fmt.Printf("Warning: failed to store newly created group chat: %v\n", err)
+	}
+
+	// Surface any participants the server refused to add.
+	var failed []string
+	for _, p := range groupInfo.Participants {
+		if p.Error != 0 {
+			failed = append(failed, fmt.Sprintf("%s (code %d)", p.JID.String(), p.Error))
+		}
+	}
+
+	return CreateGroupResponse{
+		Success:          true,
+		Message:          "Group created",
+		JID:              groupInfo.JID.String(),
+		Name:             groupInfo.Name,
+		ParticipantCount: groupInfo.ParticipantCount,
+		FailedAdds:       failed,
+	}
+}
+
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	_, err := store.db.Exec(
@@ -641,7 +853,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -774,6 +986,50 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for leaving a group
+	http.HandleFunc("/api/leave_group", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req LeaveGroupRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request to leave group %s\n", req.JID)
+		resp := leaveWhatsAppGroup(client, req.JID)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for creating a group
+	http.HandleFunc("/api/create_group", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req CreateGroupRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Printf("Received request to create group %q with %d participants\n", req.Name, len(req.Participants))
+
+		resp := createWhatsAppGroup(client, messageStore, req)
+
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -791,6 +1047,9 @@ func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
 
+	// Load privacy allow-list before any DB writes can happen
+	loadAllowList()
+
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
@@ -800,14 +1059,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -859,31 +1118,79 @@ func main() {
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
 		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
+		pairPhone := strings.TrimPrefix(strings.TrimSpace(os.Getenv("WA_PAIR_PHONE")), "+")
 
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
+		if pairPhone != "" {
+			// Phone-pairing flow: connect first, then request 8-char pairing code
+			err = client.Connect()
+			if err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				return
 			}
-		}
+			// Wait briefly for socket to settle before PairPhone
+			for i := 0; i < 20; i++ {
+				if client.IsConnected() {
+					break
+				}
+				time.Sleep(250 * time.Millisecond)
+			}
+			time.Sleep(1 * time.Second)
+			code, err := client.PairPhone(context.Background(), pairPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+			if err != nil {
+				logger.Errorf("Failed to request pairing code: %v", err)
+				return
+			}
+			fmt.Printf("\n\n>>> WhatsApp pairing code: %s <<<\n\n", code)
+			if err := os.WriteFile("/tmp/wa-pair-code.txt", []byte(code), 0644); err != nil {
+				logger.Warnf("Failed to write pair code: %v", err)
+			}
+			// Wait for pairing to complete (Store.ID becomes set after PairSuccess)
+			deadline := time.Now().Add(3 * time.Minute)
+			for time.Now().Before(deadline) {
+				if client.Store.ID != nil && client.IsLoggedIn() {
+					connected <- true
+					break
+				}
+				time.Sleep(1 * time.Second)
+			}
+			select {
+			case <-connected:
+				fmt.Println("\nSuccessfully connected and authenticated!")
+			default:
+				logger.Errorf("Timeout waiting for pairing code entry")
+				return
+			}
+		} else {
+			// QR-pairing flow (default)
+			qrChan, _ := client.GetQRChannel(context.Background())
+			err = client.Connect()
+			if err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				return
+			}
 
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
+			// Print QR code for pairing with phone
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					fmt.Println("\nScan this QR code with your WhatsApp app:")
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					if err := os.WriteFile("/tmp/wa-qr-code.txt", []byte(evt.Code), 0644); err != nil {
+						logger.Warnf("Failed to write QR code text: %v", err)
+					}
+				} else if evt.Event == "success" {
+					connected <- true
+					break
+				}
+			}
+
+			// Wait for connection
+			select {
+			case <-connected:
+				fmt.Println("\nSuccessfully connected and authenticated!")
+			case <-time.After(3 * time.Minute):
+				logger.Errorf("Timeout waiting for QR code scan")
+				return
+			}
 		}
 	} else {
 		// Already logged in, just connect
@@ -973,7 +1280,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1295,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

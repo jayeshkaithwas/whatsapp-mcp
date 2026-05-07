@@ -12,7 +12,9 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    create_group as whatsapp_create_group,
+    leave_group as whatsapp_leave_group
 )
 
 # Initialize FastMCP server
@@ -245,6 +247,64 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def create_group(
+    name: str,
+    participants: List[str],
+    announce: bool = False,
+    locked: bool = False,
+    ephemeral_seconds: int = 0,
+    is_community: bool = False,
+    community_parent_jid: str = "",
+    join_approval_required: bool = False,
+) -> Dict[str, Any]:
+    """Create a new WhatsApp group.
+
+    Args:
+        name: Group subject (max 25 characters per WhatsApp's limit)
+        participants: List of phone numbers (country code, no '+') or JIDs (e.g., "919866457501" or "919866457501@s.whatsapp.net").
+                      Your own number is added automatically — do not include it.
+        announce: If True, only admins can send messages
+        locked: If True, only admins can edit group info (subject, description, picture)
+        ephemeral_seconds: Disappearing-messages timer in seconds (0 disables; common values: 86400, 604800, 7776000)
+        is_community: If True, create a community parent instead of a normal group
+        community_parent_jid: If set, create this group as a sub-group inside the given community (mutually exclusive with is_community)
+        join_approval_required: If True, new members need admin approval to join
+
+    Returns:
+        Dict with: success (bool), message (str), and on success: jid, name, participant_count, failed_adds (list of "<jid> (code N)" for participants the server refused).
+    """
+    success, message, details = whatsapp_create_group(
+        name=name,
+        participants=participants,
+        announce=announce,
+        locked=locked,
+        ephemeral_seconds=ephemeral_seconds,
+        is_community=is_community,
+        community_parent_jid=community_parent_jid,
+        join_approval_required=join_approval_required,
+    )
+    response: Dict[str, Any] = {"success": success, "message": message}
+    if success and details:
+        response.update(details)
+    return response
+
+
+@mcp.tool()
+def leave_group(jid: str) -> Dict[str, Any]:
+    """Leave a WhatsApp group. Note: WhatsApp has no 'delete group' — leaving is the closest action.
+    Other members will see "<you> left" and the group remains on their side.
+
+    Args:
+        jid: The group JID (must end with @g.us, e.g. "120363426272007458@g.us")
+
+    Returns:
+        Dict with success (bool) and message (str).
+    """
+    success, message = whatsapp_leave_group(jid)
+    return {"success": success, "message": message}
+
 
 if __name__ == "__main__":
     # Initialize and run the server
