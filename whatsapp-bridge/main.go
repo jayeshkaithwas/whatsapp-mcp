@@ -163,6 +163,24 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// UpsertGroup inserts or updates a group's name without touching
+// last_message_time. Used by the joined-groups bootstrap/resync paths, which
+// know the JID and current name but have no message timestamp to attach. On
+// rename, only the name changes; never-active groups keep last_message_time
+// NULL so they sort to the bottom of list_chats by default.
+func (store *MessageStore) UpsertGroup(jid, name string) error {
+	if !isStorableJID(jid) {
+		return nil
+	}
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, name) VALUES (?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET name = excluded.name
+		 WHERE COALESCE(chats.name, '') IS NOT COALESCE(excluded.name, '')`,
+		jid, name,
+	)
+	return err
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
@@ -259,10 +277,14 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	// Mentions is an optional list of participants to @-tag. Each entry is a phone
+	// number (country code, no '+') or a full JID. The caller must also include the
+	// matching "@<number>" token in Message text so the client renders the tag.
+	Mentions []string `json:"mentions,omitempty"`
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, mentions []string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -415,6 +437,28 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
 			}
+		}
+	} else if len(mentions) > 0 {
+		// Build an ExtendedTextMessage so we can attach mentioned JIDs. WhatsApp
+		// renders an "@<number>" token in the text as the contact's name only when
+		// the corresponding JID is present in ContextInfo.MentionedJID.
+		mentionedJIDs := make([]string, 0, len(mentions))
+		for _, m := range mentions {
+			m = strings.TrimSpace(m)
+			if m == "" {
+				continue
+			}
+			if strings.Contains(m, "@") {
+				mentionedJIDs = append(mentionedJIDs, m) // already a JID (e.g. ...@s.whatsapp.net or ...@lid)
+			} else {
+				mentionedJIDs = append(mentionedJIDs, m+"@s.whatsapp.net")
+			}
+		}
+		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+			Text: proto.String(message),
+			ContextInfo: &waProto.ContextInfo{
+				MentionedJID: mentionedJIDs,
+			},
 		}
 	} else {
 		msg.Conversation = proto.String(message)
@@ -576,6 +620,592 @@ type LeaveGroupResponse struct {
 	Message string `json:"message"`
 }
 
+// AddGroupParticipantsRequest represents the request body for the add participants API.
+type AddGroupParticipantsRequest struct {
+	GroupJID     string   `json:"group_jid"`
+	Participants []string `json:"participants"`
+}
+
+// ParticipantResult is one row of the add-participants outcome.
+type ParticipantResult struct {
+	JID         string `json:"jid"`
+	ErrorCode   int    `json:"error_code,omitempty"`
+	InviteSent  bool   `json:"invite_sent,omitempty"`
+	InviteError string `json:"invite_error,omitempty"`
+}
+
+// GetGroupInviteLinkRequest represents the request body for the invite-link API.
+type GetGroupInviteLinkRequest struct {
+	JID   string `json:"jid"`
+	Reset bool   `json:"reset,omitempty"`
+}
+
+// GetGroupInviteLinkResponse represents the response for the invite-link API.
+type GetGroupInviteLinkResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+	JID     string `json:"jid,omitempty"`
+	Link    string `json:"link,omitempty"`
+}
+
+// getGroupInviteLink fetches (or, when reset=true, regenerates) a group's invite link.
+func getGroupInviteLink(client *whatsmeow.Client, jidStr string, reset bool) GetGroupInviteLinkResponse {
+	if !client.IsConnected() {
+		return GetGroupInviteLinkResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	groupJID, err := parseGroupJID(jidStr)
+	if err != nil {
+		return GetGroupInviteLinkResponse{Success: false, Message: err.Error()}
+	}
+	link, err := client.GetGroupInviteLink(context.Background(), groupJID, reset)
+	if err != nil {
+		return GetGroupInviteLinkResponse{Success: false, Message: fmt.Sprintf("Error fetching invite link: %v", err)}
+	}
+	return GetGroupInviteLinkResponse{Success: true, JID: groupJID.String(), Link: link}
+}
+
+// AddGroupParticipantsResponse represents the response for the add participants API.
+type AddGroupParticipantsResponse struct {
+	Success bool                `json:"success"`
+	Message string              `json:"message"`
+	Added   []ParticipantResult `json:"added,omitempty"`
+	Failed  []ParticipantResult `json:"failed,omitempty"`
+}
+
+// GetGroupInfoRequest represents the request body for the get group info API.
+type GetGroupInfoRequest struct {
+	JID string `json:"jid"`
+}
+
+// GroupParticipantInfo is the JSON shape for a single group member.
+type GroupParticipantInfo struct {
+	JID          string `json:"jid"`
+	PhoneNumber  string `json:"phone_number,omitempty"`
+	LID          string `json:"lid,omitempty"`
+	IsAdmin      bool   `json:"is_admin"`
+	IsSuperAdmin bool   `json:"is_super_admin"`
+	DisplayName  string `json:"display_name,omitempty"`
+}
+
+// GetGroupInfoResponse represents the response for the get group info API.
+type GetGroupInfoResponse struct {
+	Success              bool                   `json:"success"`
+	Message              string                 `json:"message,omitempty"`
+	JID                  string                 `json:"jid,omitempty"`
+	Name                 string                 `json:"name,omitempty"`
+	Topic                string                 `json:"topic,omitempty"`
+	OwnerJID             string                 `json:"owner_jid,omitempty"`
+	Created              string                 `json:"created,omitempty"`
+	IsAnnounce           bool                   `json:"is_announce,omitempty"`
+	IsLocked             bool                   `json:"is_locked,omitempty"`
+	IsEphemeral          bool                   `json:"is_ephemeral,omitempty"`
+	DisappearingTimer    uint32                 `json:"disappearing_timer,omitempty"`
+	IsCommunity          bool                   `json:"is_community,omitempty"`
+	LinkedParentJID      string                 `json:"linked_parent_jid,omitempty"`
+	JoinApprovalRequired bool                   `json:"join_approval_required,omitempty"`
+	ParticipantCount     int                    `json:"participant_count"`
+	Participants         []GroupParticipantInfo `json:"participants"`
+}
+
+// ResolveInviteLinkRequest represents the request body for the resolve invite-link API.
+type ResolveInviteLinkRequest struct {
+	Link string `json:"link"`
+}
+
+// ListedGroupInfo is the JSON shape for a single group in the joined-groups list.
+type ListedGroupInfo struct {
+	JID              string `json:"jid"`
+	Name             string `json:"name"`
+	Topic            string `json:"topic,omitempty"`
+	ParticipantCount int    `json:"participant_count"`
+	IsAnnounce       bool   `json:"is_announce,omitempty"`
+	IsLocked         bool   `json:"is_locked,omitempty"`
+	IsCommunity      bool   `json:"is_community,omitempty"`
+}
+
+// ListJoinedGroupsResponse represents the response for the list joined groups API.
+type ListJoinedGroupsResponse struct {
+	Success bool              `json:"success"`
+	Message string            `json:"message,omitempty"`
+	Count   int               `json:"count"`
+	Groups  []ListedGroupInfo `json:"groups"`
+	Synced  int               `json:"synced,omitempty"`
+}
+
+// parseGroupJID parses a string into a group JID and validates the @g.us suffix.
+func parseGroupJID(jidStr string) (types.JID, error) {
+	jidStr = strings.TrimSpace(jidStr)
+	if jidStr == "" {
+		return types.JID{}, fmt.Errorf("group JID is required")
+	}
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return types.JID{}, fmt.Errorf("invalid JID: %v", err)
+	}
+	if jid.Server != "g.us" {
+		return types.JID{}, fmt.Errorf("only group JIDs (@g.us) are accepted")
+	}
+	return jid, nil
+}
+
+// addGroupParticipants adds the given participants to a group via whatsmeow.
+// When WhatsApp refuses to add someone (typically error 403 due to their privacy
+// setting "Who can add me to groups"), the bridge automatically fetches the group's
+// invite link and DMs it to that contact along with the group name, so they can
+// join voluntarily. Each failure entry reports whether the invite link DM succeeded.
+func addGroupParticipants(client *whatsmeow.Client, req AddGroupParticipantsRequest) AddGroupParticipantsResponse {
+	if !client.IsConnected() {
+		return AddGroupParticipantsResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	groupJID, err := parseGroupJID(req.GroupJID)
+	if err != nil {
+		return AddGroupParticipantsResponse{Success: false, Message: err.Error()}
+	}
+	if len(req.Participants) == 0 {
+		return AddGroupParticipantsResponse{Success: false, Message: "At least one participant is required"}
+	}
+
+	type inputEntry struct {
+		original string
+		jid      types.JID
+	}
+	var inputs []inputEntry
+	for _, p := range req.Participants {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		var pjid types.JID
+		var perr error
+		if strings.Contains(p, "@") {
+			pjid, perr = types.ParseJID(p)
+			if perr != nil {
+				return AddGroupParticipantsResponse{Success: false, Message: fmt.Sprintf("Invalid participant JID %q: %v", p, perr)}
+			}
+		} else {
+			pjid = types.JID{User: strings.TrimPrefix(p, "+"), Server: "s.whatsapp.net"}
+		}
+		inputs = append(inputs, inputEntry{original: p, jid: pjid})
+	}
+	if len(inputs) == 0 {
+		return AddGroupParticipantsResponse{Success: false, Message: "No valid participants after parsing"}
+	}
+
+	participantJIDs := make([]types.JID, len(inputs))
+	for i, e := range inputs {
+		participantJIDs[i] = e.jid
+	}
+
+	results, err := client.UpdateGroupParticipants(context.Background(), groupJID, participantJIDs, whatsmeow.ParticipantChangeAdd)
+	if err != nil {
+		return AddGroupParticipantsResponse{Success: false, Message: fmt.Sprintf("Error adding participants: %v", err)}
+	}
+
+	// Lazy-fetch the invite link + group name only if at least one failure happens.
+	var (
+		inviteLink      string
+		groupName       string
+		inviteFetchErr  error
+		inviteAttempted bool
+	)
+	fetchInvite := func() {
+		if inviteAttempted {
+			return
+		}
+		inviteAttempted = true
+		link, ferr := client.GetGroupInviteLink(context.Background(), groupJID, false)
+		if ferr != nil {
+			inviteFetchErr = ferr
+			return
+		}
+		inviteLink = link
+		if info, ierr := client.GetGroupInfo(context.Background(), groupJID); ierr == nil {
+			groupName = info.Name
+		}
+	}
+
+	var added, failed []ParticipantResult
+	for i, p := range results {
+		entry := ParticipantResult{JID: p.JID.String(), ErrorCode: p.Error}
+		if p.Error == 0 {
+			added = append(added, entry)
+			continue
+		}
+
+		fetchInvite()
+		if inviteFetchErr != nil {
+			entry.InviteError = fmt.Sprintf("could not fetch invite link: %v", inviteFetchErr)
+			failed = append(failed, entry)
+			continue
+		}
+
+		// Use the original input (always s.whatsapp.net) as the DM recipient.
+		// Falls back to the result's PhoneNumber/JID when ordering can't be relied on.
+		var recipient string
+		if i < len(inputs) {
+			recipient = inputs[i].jid.String()
+		} else if !p.PhoneNumber.IsEmpty() {
+			recipient = p.PhoneNumber.String()
+		} else {
+			recipient = p.JID.String()
+		}
+
+		var body string
+		if groupName != "" {
+			body = fmt.Sprintf("You've been invited to join the WhatsApp group \"%s\".\n\n%s\n\nTap the link to join.", groupName, inviteLink)
+		} else {
+			body = fmt.Sprintf("You've been invited to join a WhatsApp group.\n\n%s\n\nTap the link to join.", inviteLink)
+		}
+
+		ok, statusMsg := sendWhatsAppMessage(client, recipient, body, "", nil)
+		if ok {
+			entry.InviteSent = true
+		} else {
+			entry.InviteError = statusMsg
+		}
+		failed = append(failed, entry)
+	}
+
+	sentCount := 0
+	for _, f := range failed {
+		if f.InviteSent {
+			sentCount++
+		}
+	}
+
+	msg := fmt.Sprintf("Added %d participant(s)", len(added))
+	if len(failed) > 0 {
+		msg += fmt.Sprintf(", %d failed", len(failed))
+		if sentCount > 0 {
+			msg += fmt.Sprintf(" (sent invite link to %d)", sentCount)
+		}
+	}
+	return AddGroupParticipantsResponse{
+		Success: len(added) > 0 || len(failed) == 0,
+		Message: msg,
+		Added:   added,
+		Failed:  failed,
+	}
+}
+
+// removeGroupParticipants removes the given participants from a group via whatsmeow.
+func removeGroupParticipants(client *whatsmeow.Client, req AddGroupParticipantsRequest) AddGroupParticipantsResponse {
+	if !client.IsConnected() {
+		return AddGroupParticipantsResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	groupJID, err := parseGroupJID(req.GroupJID)
+	if err != nil {
+		return AddGroupParticipantsResponse{Success: false, Message: err.Error()}
+	}
+	if len(req.Participants) == 0 {
+		return AddGroupParticipantsResponse{Success: false, Message: "At least one participant is required"}
+	}
+
+	var participantJIDs []types.JID
+	for _, p := range req.Participants {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		var pjid types.JID
+		if strings.Contains(p, "@") {
+			pjid, err = types.ParseJID(p)
+			if err != nil {
+				return AddGroupParticipantsResponse{Success: false, Message: fmt.Sprintf("Invalid participant JID %q: %v", p, err)}
+			}
+		} else {
+			pjid = types.JID{User: strings.TrimPrefix(p, "+"), Server: "s.whatsapp.net"}
+		}
+		participantJIDs = append(participantJIDs, pjid)
+	}
+	if len(participantJIDs) == 0 {
+		return AddGroupParticipantsResponse{Success: false, Message: "No valid participants after parsing"}
+	}
+
+	results, err := client.UpdateGroupParticipants(context.Background(), groupJID, participantJIDs, whatsmeow.ParticipantChangeRemove)
+	if err != nil {
+		return AddGroupParticipantsResponse{Success: false, Message: fmt.Sprintf("Error removing participants: %v", err)}
+	}
+
+	var removed, failed []ParticipantResult
+	for _, p := range results {
+		entry := ParticipantResult{JID: p.JID.String(), ErrorCode: p.Error}
+		if p.Error == 0 {
+			removed = append(removed, entry)
+		} else {
+			failed = append(failed, entry)
+		}
+	}
+
+	msg := fmt.Sprintf("Removed %d participant(s)", len(removed))
+	if len(failed) > 0 {
+		msg += fmt.Sprintf(", %d failed", len(failed))
+	}
+	return AddGroupParticipantsResponse{
+		Success: len(removed) > 0 || len(failed) == 0,
+		Message: msg,
+		Added:   removed,
+		Failed:  failed,
+	}
+}
+
+// getGroupInfo returns full group metadata including the participant list.
+func getGroupInfo(client *whatsmeow.Client, jidStr string) GetGroupInfoResponse {
+	if !client.IsConnected() {
+		return GetGroupInfoResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	groupJID, err := parseGroupJID(jidStr)
+	if err != nil {
+		return GetGroupInfoResponse{Success: false, Message: err.Error()}
+	}
+
+	info, err := client.GetGroupInfo(context.Background(), groupJID)
+	if err != nil {
+		return GetGroupInfoResponse{Success: false, Message: fmt.Sprintf("Error fetching group info: %v", err)}
+	}
+
+	participants := make([]GroupParticipantInfo, 0, len(info.Participants))
+	for _, p := range info.Participants {
+		pi := GroupParticipantInfo{
+			JID:          p.JID.String(),
+			IsAdmin:      p.IsAdmin,
+			IsSuperAdmin: p.IsSuperAdmin,
+			DisplayName:  p.DisplayName,
+		}
+		if !p.PhoneNumber.IsEmpty() {
+			pi.PhoneNumber = p.PhoneNumber.User
+		} else if p.JID.Server == "s.whatsapp.net" {
+			pi.PhoneNumber = p.JID.User
+		}
+		if !p.LID.IsEmpty() {
+			pi.LID = p.LID.String()
+		}
+		// Try to enrich with the contact's stored full name when whatsmeow didn't supply one.
+		if pi.DisplayName == "" {
+			if contact, cerr := client.Store.Contacts.GetContact(context.Background(), p.JID); cerr == nil {
+				if contact.FullName != "" {
+					pi.DisplayName = contact.FullName
+				} else if contact.PushName != "" {
+					pi.DisplayName = contact.PushName
+				}
+			}
+		}
+		participants = append(participants, pi)
+	}
+
+	created := ""
+	if !info.GroupCreated.IsZero() {
+		created = info.GroupCreated.UTC().Format(time.RFC3339)
+	}
+
+	return GetGroupInfoResponse{
+		Success:              true,
+		JID:                  info.JID.String(),
+		Name:                 info.Name,
+		Topic:                info.Topic,
+		OwnerJID:             info.OwnerJID.String(),
+		Created:              created,
+		IsAnnounce:           info.IsAnnounce,
+		IsLocked:             info.IsLocked,
+		IsEphemeral:          info.IsEphemeral,
+		DisappearingTimer:    info.DisappearingTimer,
+		IsCommunity:          info.IsParent,
+		LinkedParentJID:      info.LinkedParentJID.String(),
+		JoinApprovalRequired: info.IsJoinApprovalRequired,
+		ParticipantCount:     len(info.Participants),
+		Participants:         participants,
+	}
+}
+
+// syncJoinedGroups fetches the full list of groups the account belongs to from
+// WhatsApp and upserts each into the local chats table. This is the core fix
+// for the "quiet groups are invisible to the MCP" class of bug: the upstream
+// bridge only ever inserts rows in response to message events, so any group
+// that hasn't seen a message since pairing never appears in list_chats. This
+// helper runs on every events.Connected and from a periodic ticker, so renames
+// and newly-joined groups also propagate without a restart.
+//
+// Returns the number of groups upserted and any error.
+func syncJoinedGroups(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) (int, error) {
+	if !client.IsConnected() {
+		return 0, fmt.Errorf("not connected to WhatsApp")
+	}
+	groups, err := client.GetJoinedGroups(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("error fetching joined groups: %v", err)
+	}
+	count := 0
+	for _, g := range groups {
+		if err := store.UpsertGroup(g.JID.String(), g.Name); err != nil {
+			logger.Warnf("Failed to upsert group %s: %v", g.JID.String(), err)
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
+// listJoinedGroups returns the full live list of groups the account is in,
+// straight from WhatsApp (bypassing the local DB). Also upserts each row into
+// the local chats table as a side effect, so subsequent list_chats calls find
+// them. Useful as an escape hatch when the local DB has drifted out of sync.
+func listJoinedGroups(client *whatsmeow.Client, store *MessageStore) ListJoinedGroupsResponse {
+	if !client.IsConnected() {
+		return ListJoinedGroupsResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	groups, err := client.GetJoinedGroups(context.Background())
+	if err != nil {
+		return ListJoinedGroupsResponse{Success: false, Message: fmt.Sprintf("Error fetching joined groups: %v", err)}
+	}
+	out := make([]ListedGroupInfo, 0, len(groups))
+	synced := 0
+	for _, g := range groups {
+		out = append(out, ListedGroupInfo{
+			JID:              g.JID.String(),
+			Name:             g.Name,
+			Topic:            g.Topic,
+			ParticipantCount: len(g.Participants),
+			IsAnnounce:       g.IsAnnounce,
+			IsLocked:         g.IsLocked,
+			IsCommunity:      g.IsParent,
+		})
+		if store != nil {
+			if uerr := store.UpsertGroup(g.JID.String(), g.Name); uerr == nil {
+				synced++
+			}
+		}
+	}
+	return ListJoinedGroupsResponse{
+		Success: true,
+		Count:   len(out),
+		Groups:  out,
+		Synced:  synced,
+	}
+}
+
+// resolveInviteLink takes a https://chat.whatsapp.com/<code> invite link (or
+// a bare invite code) and asks WhatsApp's servers to resolve it to a full
+// GroupInfo. On success the result is also upserted into the local chats
+// table, so a subsequent send_message / list_chats finds the group without
+// any extra hop. This is the single tool that would have unblocked the
+// "I have the invite link but the bridge has never seen this group" case.
+func resolveInviteLink(client *whatsmeow.Client, store *MessageStore, link string) GetGroupInfoResponse {
+	if !client.IsConnected() {
+		return GetGroupInfoResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	code := strings.TrimSpace(link)
+	if code == "" {
+		return GetGroupInfoResponse{Success: false, Message: "Invite link or code is required"}
+	}
+	// Accept either a full URL ("https://chat.whatsapp.com/<code>") or the
+	// bare code. Strip any trailing query string.
+	if idx := strings.LastIndex(code, "/"); idx >= 0 {
+		code = code[idx+1:]
+	}
+	if i := strings.Index(code, "?"); i >= 0 {
+		code = code[:i]
+	}
+	if code == "" {
+		return GetGroupInfoResponse{Success: false, Message: "Could not extract invite code from input"}
+	}
+
+	info, err := client.GetGroupInfoFromLink(context.Background(), code)
+	if err != nil {
+		return GetGroupInfoResponse{Success: false, Message: fmt.Sprintf("Error resolving invite link: %v", err)}
+	}
+	if store != nil {
+		if uerr := store.UpsertGroup(info.JID.String(), info.Name); uerr != nil {
+			// Non-fatal: caller still gets the resolved JID, just not auto-persisted.
+			fmt.Printf("[resolve_invite_link] Failed to upsert %s: %v\n", info.JID.String(), uerr)
+		}
+	}
+
+	participants := make([]GroupParticipantInfo, 0, len(info.Participants))
+	for _, p := range info.Participants {
+		pi := GroupParticipantInfo{
+			JID:          p.JID.String(),
+			IsAdmin:      p.IsAdmin,
+			IsSuperAdmin: p.IsSuperAdmin,
+			DisplayName:  p.DisplayName,
+		}
+		if !p.PhoneNumber.IsEmpty() {
+			pi.PhoneNumber = p.PhoneNumber.User
+		} else if p.JID.Server == "s.whatsapp.net" {
+			pi.PhoneNumber = p.JID.User
+		}
+		if !p.LID.IsEmpty() {
+			pi.LID = p.LID.String()
+		}
+		participants = append(participants, pi)
+	}
+
+	created := ""
+	if !info.GroupCreated.IsZero() {
+		created = info.GroupCreated.UTC().Format(time.RFC3339)
+	}
+
+	return GetGroupInfoResponse{
+		Success:              true,
+		JID:                  info.JID.String(),
+		Name:                 info.Name,
+		Topic:                info.Topic,
+		OwnerJID:             info.OwnerJID.String(),
+		Created:              created,
+		IsAnnounce:           info.IsAnnounce,
+		IsLocked:             info.IsLocked,
+		IsEphemeral:          info.IsEphemeral,
+		DisappearingTimer:    info.DisappearingTimer,
+		IsCommunity:          info.IsParent,
+		LinkedParentJID:      info.LinkedParentJID.String(),
+		JoinApprovalRequired: info.IsJoinApprovalRequired,
+		ParticipantCount:     len(info.Participants),
+		Participants:         participants,
+	}
+}
+
+// getResyncInterval reads the WHATSAPP_GROUP_RESYNC_INTERVAL env var (e.g.
+// "10m", "30s"). Defaults to 10 minutes. Values below 30s are rejected as
+// likely-typos and fall back to the default.
+func getResyncInterval() time.Duration {
+	const defaultInterval = 10 * time.Minute
+	s := strings.TrimSpace(os.Getenv("WHATSAPP_GROUP_RESYNC_INTERVAL"))
+	if s == "" {
+		return defaultInterval
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		fmt.Printf("[group-resync] Invalid WHATSAPP_GROUP_RESYNC_INTERVAL=%q (using default %s): %v\n", s, defaultInterval, err)
+		return defaultInterval
+	}
+	if d < 30*time.Second {
+		fmt.Printf("[group-resync] WHATSAPP_GROUP_RESYNC_INTERVAL=%s too low, using default %s\n", d, defaultInterval)
+		return defaultInterval
+	}
+	return d
+}
+
+// runGroupResyncLoop runs a background ticker that re-syncs joined groups
+// from WhatsApp into the local DB. Catches renames, newly-joined groups, and
+// any drift that happens while the bridge is running (separate from the
+// on-connect bootstrap, which catches drift accumulated while it was down).
+func runGroupResyncLoop(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) {
+	interval := getResyncInterval()
+	fmt.Printf("[group-resync] Polling joined groups every %s\n", interval)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !client.IsConnected() {
+			continue
+		}
+		count, err := syncJoinedGroups(client, store, logger)
+		if err != nil {
+			logger.Warnf("[group-resync] Sync failed: %v", err)
+			continue
+		}
+		logger.Infof("[group-resync] Synced %d groups", count)
+	}
+}
+
 // leaveWhatsAppGroup leaves the specified group on WhatsApp.
 func leaveWhatsAppGroup(client *whatsmeow.Client, jidStr string) LeaveGroupResponse {
 	if !client.IsConnected() {
@@ -606,9 +1236,10 @@ func createWhatsAppGroup(client *whatsmeow.Client, messageStore *MessageStore, r
 	if strings.TrimSpace(req.Name) == "" {
 		return CreateGroupResponse{Success: false, Message: "Group name is required"}
 	}
-	// WhatsApp limits group subjects to 25 characters; whatsmeow returns 406 otherwise.
-	if len([]rune(req.Name)) > 25 {
-		return CreateGroupResponse{Success: false, Message: "Group name must be 25 characters or fewer"}
+	// WhatsApp's real limit is ~100 characters (the historical 25-char comment is outdated; existing
+	// groups created via the WhatsApp app already exceed 30 chars).
+	if len([]rune(req.Name)) > 100 {
+		return CreateGroupResponse{Success: false, Message: "Group name must be 100 characters or fewer"}
 	}
 	if len(req.Participants) == 0 {
 		return CreateGroupResponse{Success: false, Message: "At least one participant is required"}
@@ -694,6 +1325,140 @@ func createWhatsAppGroup(client *whatsmeow.Client, messageStore *MessageStore, r
 		ParticipantCount: groupInfo.ParticipantCount,
 		FailedAdds:       failed,
 	}
+}
+
+// --- Extension: rename group, set group photo, promote/demote admins ---
+
+type SetGroupNameRequest struct {
+	JID  string `json:"jid"`
+	Name string `json:"name"`
+}
+
+type SetGroupNameResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	JID     string `json:"jid,omitempty"`
+	Name    string `json:"name,omitempty"`
+}
+
+func setGroupName(client *whatsmeow.Client, jidStr, name string) SetGroupNameResponse {
+	if !client.IsConnected() {
+		return SetGroupNameResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	jid, err := parseGroupJID(jidStr)
+	if err != nil {
+		return SetGroupNameResponse{Success: false, Message: err.Error()}
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return SetGroupNameResponse{Success: false, Message: "Name is required"}
+	}
+	if len([]rune(name)) > 100 {
+		return SetGroupNameResponse{Success: false, Message: "Group name must be 100 characters or fewer"}
+	}
+	if err := client.SetGroupName(context.Background(), jid, name); err != nil {
+		return SetGroupNameResponse{Success: false, Message: fmt.Sprintf("Error: %v", err)}
+	}
+	return SetGroupNameResponse{Success: true, Message: "Group name updated", JID: jid.String(), Name: name}
+}
+
+type SetGroupPhotoRequest struct {
+	JID  string `json:"jid"`
+	Path string `json:"path"` // absolute path to a JPEG/PNG image on the bridge host
+}
+
+type SetGroupPhotoResponse struct {
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	JID       string `json:"jid,omitempty"`
+	PictureID string `json:"picture_id,omitempty"`
+}
+
+func setGroupPhoto(client *whatsmeow.Client, jidStr, path string) SetGroupPhotoResponse {
+	if !client.IsConnected() {
+		return SetGroupPhotoResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	jid, err := parseGroupJID(jidStr)
+	if err != nil {
+		return SetGroupPhotoResponse{Success: false, Message: err.Error()}
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return SetGroupPhotoResponse{Success: false, Message: "Path is required"}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return SetGroupPhotoResponse{Success: false, Message: fmt.Sprintf("Cannot read file: %v", err)}
+	}
+	pictureID, err := client.SetGroupPhoto(context.Background(), jid, data)
+	if err != nil {
+		return SetGroupPhotoResponse{Success: false, Message: fmt.Sprintf("Error: %v", err)}
+	}
+	return SetGroupPhotoResponse{Success: true, Message: "Group photo updated", JID: jid.String(), PictureID: pictureID}
+}
+
+type UpdateGroupAdminsRequest struct {
+	GroupJID     string   `json:"group_jid"`
+	Participants []string `json:"participants"`
+	Action       string   `json:"action"` // "promote" or "demote"
+}
+
+type UpdateGroupAdminsResponse struct {
+	Success bool                `json:"success"`
+	Message string              `json:"message"`
+	Results []ParticipantResult `json:"results,omitempty"`
+}
+
+func updateGroupAdmins(client *whatsmeow.Client, req UpdateGroupAdminsRequest) UpdateGroupAdminsResponse {
+	if !client.IsConnected() {
+		return UpdateGroupAdminsResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	groupJID, err := parseGroupJID(req.GroupJID)
+	if err != nil {
+		return UpdateGroupAdminsResponse{Success: false, Message: err.Error()}
+	}
+	var change whatsmeow.ParticipantChange
+	switch strings.ToLower(strings.TrimSpace(req.Action)) {
+	case "promote":
+		change = whatsmeow.ParticipantChangePromote
+	case "demote":
+		change = whatsmeow.ParticipantChangeDemote
+	default:
+		return UpdateGroupAdminsResponse{Success: false, Message: "Action must be 'promote' or 'demote'"}
+	}
+	if len(req.Participants) == 0 {
+		return UpdateGroupAdminsResponse{Success: false, Message: "At least one participant is required"}
+	}
+	pjids := make([]types.JID, 0, len(req.Participants))
+	for _, p := range req.Participants {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		var pjid types.JID
+		var perr error
+		if strings.Contains(p, "@") {
+			pjid, perr = types.ParseJID(p)
+			if perr != nil {
+				return UpdateGroupAdminsResponse{Success: false, Message: fmt.Sprintf("Invalid participant JID %q: %v", p, perr)}
+			}
+		} else {
+			pjid = types.JID{User: strings.TrimPrefix(p, "+"), Server: "s.whatsapp.net"}
+		}
+		pjids = append(pjids, pjid)
+	}
+	if len(pjids) == 0 {
+		return UpdateGroupAdminsResponse{Success: false, Message: "No valid participants after parsing"}
+	}
+	results, err := client.UpdateGroupParticipants(context.Background(), groupJID, pjids, change)
+	if err != nil {
+		return UpdateGroupAdminsResponse{Success: false, Message: fmt.Sprintf("Error updating admins: %v", err)}
+	}
+	out := make([]ParticipantResult, 0, len(results))
+	for _, r := range results {
+		out = append(out, ParticipantResult{JID: r.JID.String(), ErrorCode: r.Error})
+	}
+	return UpdateGroupAdminsResponse{Success: true, Message: "Admins updated", Results: out}
 }
 
 // Store additional media info in the database
@@ -918,7 +1683,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.Mentions)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1006,6 +1771,85 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(resp)
 	})
 
+	// Handler for adding participants to a group
+	http.HandleFunc("/api/add_group_participants", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req AddGroupParticipantsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request to add %d participants to %s\n", len(req.Participants), req.GroupJID)
+		resp := addGroupParticipants(client, req)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for fetching (or rotating) a group's invite link
+	http.HandleFunc("/api/remove_group_participants", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req AddGroupParticipantsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request to remove %d participants from %s\n", len(req.Participants), req.GroupJID)
+		resp := removeGroupParticipants(client, req)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	http.HandleFunc("/api/get_group_invite_link", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req GetGroupInviteLinkRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request for invite link for %s (reset=%t)\n", req.JID, req.Reset)
+		resp := getGroupInviteLink(client, req.JID, req.Reset)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for fetching full group info (including participant list)
+	http.HandleFunc("/api/get_group_info", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req GetGroupInfoRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request for group info on %s\n", req.JID)
+		resp := getGroupInfo(client, req.JID)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
 	// Handler for creating a group
 	http.HandleFunc("/api/create_group", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1023,6 +1867,103 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		resp := createWhatsAppGroup(client, messageStore, req)
 
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for renaming a group
+	http.HandleFunc("/api/set_group_name", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req SetGroupNameRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request to set group name for %s to %q\n", req.JID, req.Name)
+		resp := setGroupName(client, req.JID, req.Name)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for setting group profile photo
+	http.HandleFunc("/api/set_group_photo", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req SetGroupPhotoRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request to set group photo for %s from %s\n", req.JID, req.Path)
+		resp := setGroupPhoto(client, req.JID, req.Path)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for listing all joined groups (live, from WhatsApp). Also upserts
+	// each row into the local chats table so list_chats sees them too.
+	http.HandleFunc("/api/list_joined_groups", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost && r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		fmt.Println("Received request to list joined groups")
+		resp := listJoinedGroups(client, messageStore)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for resolving a chat.whatsapp.com invite link to a group JID.
+	// Auto-persists the resolved group into the local chats table on success.
+	http.HandleFunc("/api/resolve_invite_link", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req ResolveInviteLinkRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request to resolve invite link: %s\n", req.Link)
+		resp := resolveInviteLink(client, messageStore, req.Link)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for promoting/demoting group admins
+	http.HandleFunc("/api/update_group_admins", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req UpdateGroupAdminsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request to %s %d admins in group %s\n", req.Action, len(req.Participants), req.GroupJID)
+		resp := updateGroupAdmins(client, req)
 		w.Header().Set("Content-Type", "application/json")
 		if !resp.Success {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1106,6 +2047,19 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			// Bootstrap the local chats table with every group the account is
+			// currently in. Without this, only groups that have sent a message
+			// since pairing ever appear in list_chats — quiet groups stay
+			// invisible forever. Runs in a goroutine to avoid blocking the
+			// event handler.
+			go func() {
+				count, err := syncJoinedGroups(client, messageStore, logger)
+				if err != nil {
+					logger.Warnf("Initial joined-groups sync failed: %v", err)
+					return
+				}
+				logger.Infof("Initial joined-groups sync complete: %d groups", count)
+			}()
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -1214,6 +2168,12 @@ func main() {
 
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
+
+	// Periodic joined-groups resync. The on-connect bootstrap catches drift
+	// accumulated while the bridge was down; this catches drift that happens
+	// while the bridge is up — renames, new joins, etc. — without needing
+	// a restart. Interval is configurable via WHATSAPP_GROUP_RESYNC_INTERVAL.
+	go runGroupResyncLoop(client, messageStore, logger)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

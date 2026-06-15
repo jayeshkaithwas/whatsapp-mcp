@@ -622,18 +622,20 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
-def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+def send_message(recipient: str, message: str, mentions: Optional[List[str]] = None) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
-        
+        if mentions:
+            payload["mentions"] = mentions
+
         response = requests.post(url, json=payload)
         
         # Check if the request was successful
@@ -723,6 +725,95 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+
+def remove_group_participants(group_jid: str, participants: List[str]) -> Tuple[bool, str, Optional[dict]]:
+    try:
+        if not group_jid or not group_jid.strip():
+            return False, "Group JID is required", None
+        if not participants:
+            return False, "At least one participant is required", None
+        url = f"{WHATSAPP_API_BASE_URL}/remove_group_participants"
+        response = requests.post(url, json={"group_jid": group_jid, "participants": participants})
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}", None
+        success = bool(result.get("success", False))
+        message = result.get("message", "Unknown response")
+        details = {
+            "removed": result.get("added") or [],
+            "failed": result.get("failed") or [],
+        }
+        return success, message, details
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
+
+def add_group_participants(group_jid: str, participants: List[str]) -> Tuple[bool, str, Optional[dict]]:
+    try:
+        if not group_jid or not group_jid.strip():
+            return False, "Group JID is required", None
+        if not participants:
+            return False, "At least one participant is required", None
+        url = f"{WHATSAPP_API_BASE_URL}/add_group_participants"
+        response = requests.post(url, json={"group_jid": group_jid, "participants": participants})
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}", None
+        success = bool(result.get("success", False))
+        message = result.get("message", "Unknown response")
+        details = {
+            "added": result.get("added") or [],
+            "failed": result.get("failed") or [],
+        }
+        return success, message, details
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
+
+def get_group_invite_link(jid: str, reset: bool = False) -> Tuple[bool, str, Optional[str]]:
+    try:
+        if not jid or not jid.strip():
+            return False, "Group JID is required", None
+        url = f"{WHATSAPP_API_BASE_URL}/get_group_invite_link"
+        response = requests.post(url, json={"jid": jid, "reset": reset})
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}", None
+        if not bool(result.get("success", False)):
+            return False, result.get("message", "Unknown response"), None
+        return True, "Invite link retrieved", result.get("link")
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
+
+def get_group_info(jid: str) -> Tuple[bool, str, Optional[dict]]:
+    try:
+        if not jid or not jid.strip():
+            return False, "Group JID is required", None
+        url = f"{WHATSAPP_API_BASE_URL}/get_group_info"
+        response = requests.post(url, json={"jid": jid})
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}", None
+        if not bool(result.get("success", False)):
+            return False, result.get("message", "Unknown response"), None
+        info = {k: v for k, v in result.items() if k not in ("success", "message")}
+        return True, "Group info retrieved", info
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
 
 def leave_group(jid: str) -> Tuple[bool, str]:
     try:
@@ -832,3 +923,132 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+def set_group_name(jid: str, name: str) -> Tuple[bool, str, Optional[dict]]:
+    """Rename a WhatsApp group (you must be admin)."""
+    try:
+        if not jid or not jid.strip():
+            return False, "Group JID is required", None
+        if not name or not name.strip():
+            return False, "Group name is required", None
+        url = f"{WHATSAPP_API_BASE_URL}/set_group_name"
+        response = requests.post(url, json={"jid": jid, "name": name})
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}", None
+        success = bool(result.get("success", False))
+        message = result.get("message", "Unknown response")
+        details = {k: v for k, v in result.items() if k not in ("success", "message")}
+        return success, message, details if details else None
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
+
+def set_group_photo(jid: str, path: str) -> Tuple[bool, str, Optional[dict]]:
+    """Set a WhatsApp group's profile photo from a local image file (you must be admin).
+
+    WhatsApp expects a JPEG, ideally square and ≤ ~640x640. PNGs may be rejected
+    with 'the given data is not a valid image' — convert to JPEG first if needed.
+    """
+    try:
+        if not jid or not jid.strip():
+            return False, "Group JID is required", None
+        if not path or not path.strip():
+            return False, "Image path is required", None
+        if not os.path.exists(path):
+            return False, f"Image file not found: {path}", None
+        url = f"{WHATSAPP_API_BASE_URL}/set_group_photo"
+        response = requests.post(url, json={"jid": jid, "path": path})
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}", None
+        success = bool(result.get("success", False))
+        message = result.get("message", "Unknown response")
+        details = {k: v for k, v in result.items() if k not in ("success", "message")}
+        return success, message, details if details else None
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
+
+def list_joined_groups() -> Tuple[bool, str, Optional[dict]]:
+    """Ask the bridge for the live list of every group the account is in,
+    bypassing the local SQLite cache. Useful when list_chats appears stale
+    (e.g. a group was renamed or is quiet enough that no message-events have
+    flowed through to the local DB). The bridge also upserts each returned
+    row into the chats table as a side effect."""
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/list_joined_groups"
+        response = requests.post(url)
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}", None
+        if not bool(result.get("success", False)):
+            return False, result.get("message", "Unknown response"), None
+        details = {
+            "count": result.get("count", 0),
+            "synced": result.get("synced", 0),
+            "groups": result.get("groups") or [],
+        }
+        return True, "Joined groups retrieved", details
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
+
+def resolve_invite_link(link: str) -> Tuple[bool, str, Optional[dict]]:
+    """Resolve a chat.whatsapp.com invite link (or bare invite code) to full
+    group info. The bridge auto-persists the resolved group into the local
+    chats table on success, so a subsequent send_message / list_chats finds
+    it immediately. Solves the 'I have a link but not the JID' bootstrap
+    problem without needing to actually join the group."""
+    try:
+        if not link or not link.strip():
+            return False, "Invite link or code is required", None
+        url = f"{WHATSAPP_API_BASE_URL}/resolve_invite_link"
+        response = requests.post(url, json={"link": link})
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}", None
+        if not bool(result.get("success", False)):
+            return False, result.get("message", "Unknown response"), None
+        info = {k: v for k, v in result.items() if k not in ("success", "message")}
+        return True, "Invite link resolved", info
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
+
+def update_group_admins(group_jid: str, participants: List[str], action: str) -> Tuple[bool, str, Optional[dict]]:
+    """Promote or demote group admins (you must be super-admin / group creator)."""
+    try:
+        if not group_jid or not group_jid.strip():
+            return False, "Group JID is required", None
+        if not participants:
+            return False, "At least one participant is required", None
+        if action not in ("promote", "demote"):
+            return False, "Action must be 'promote' or 'demote'", None
+        url = f"{WHATSAPP_API_BASE_URL}/update_group_admins"
+        response = requests.post(url, json={"group_jid": group_jid, "participants": participants, "action": action})
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}", None
+        success = bool(result.get("success", False))
+        message = result.get("message", "Unknown response")
+        details = {"results": result.get("results") or []}
+        return success, message, details
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None

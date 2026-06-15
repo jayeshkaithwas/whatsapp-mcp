@@ -14,3 +14,6 @@ whatsapp-bridge/store/
 __pycache__/
 *.pyc
 .venv/
+
+# Deployment-specific operational scripts (internal, not for the public repo)
+scripts/
